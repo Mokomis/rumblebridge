@@ -494,6 +494,10 @@ static int port_occupied(void) {
 static void set_razer_app(int on) {
   pid_t pid = fork();
   if (pid == 0) {
+    // "cmd" hands its own stdin, stdout and stderr to the package service, which may not use this
+    // daemon's log file: the call then fails outright. /dev/null it accepts.
+    int null = open("/dev/null", O_RDWR);
+    dup2(null, 0), dup2(null, 1), dup2(null, 2);
     if (on) execl("/system/bin/cmd", "cmd", "package", "enable", RAZER_APP, (char *)NULL);
     else execl("/system/bin/cmd", "cmd", "package", "disable-user", "--user", "0", RAZER_APP, (char *)NULL);
     _exit(127);
