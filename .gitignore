@@ -1,0 +1,5 @@
+app/build/
+app/debug.keystore
+daemon/rumblebridged
+hook/librumblehook.so
+__pycache__/
