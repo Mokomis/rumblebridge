@@ -69,6 +69,7 @@
 #define TOKEN_LEN 16
 #define VIRTUAL_NAME "Razer Kishi V3 Pro (rumble)"
 #define RAZER_APP "com.razer.bianca"
+#define DEAF_FRAMES 10             // this many frames in a row unanswered, and the user is told
 #define HOLD_GRACE_MS 5000         // a pad is never dropped sooner than this after the Kishi goes
 #define HOLD_UNKNOWN_MS 3600000    // how long it is kept where the port cannot say what is plugged in
 #define BITS_PER_LONG (8 * sizeof(long))
@@ -254,7 +255,11 @@ static int send_frame(int usb, int low, int high) {
   if (ioctl(usb, USBDEVFS_BULK, &out) < 0) return -1;
   uint8_t answer[64];
   struct usbdevfs_bulktransfer in = {.ep = HAPTICS_IN, .len = sizeof answer, .timeout = 30, .data = answer};
-  return ioctl(usb, USBDEVFS_BULK, &in) > 0 ? 1 : 0;
+  int answered = ioctl(usb, USBDEVFS_BULK, &in) > 0;
+#ifdef TEST_DEAF  // test builds only: a Kishi that plays but is reported as not answering
+  if (access("/data/local/tmp/rumblebridge-test-deaf", F_OK) == 0) answered = 0;
+#endif
+  return answered;
 }
 
 // Where things stand. attached: the Kishi's buttons and haptics are open. Otherwise the virtual
@@ -289,13 +294,32 @@ static void write_status(void) {
   close(fd);
 }
 
+/**
+ * Puts a notification in the tablet's shade, replacing the last one from here. "cmd notification"
+ * refuses root but serves the shell user, so the child becomes that first; and it must not be
+ * handed this daemon's log file as its output (see set_razer_app).
+ */
+static void notify(const char *text) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    int null = open("/dev/null", O_RDWR);
+    dup2(null, 0), dup2(null, 1), dup2(null, 2);
+    if (setresgid(2000, 2000, 2000) < 0 || setresuid(2000, 2000, 2000) < 0) _exit(126);
+    execl("/system/bin/cmd", "cmd", "notification", "post", "-t", "Rumblebridge", "rumblebridge", text, (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (pid > 0) waitpid(pid, &status, 0);
+  printf("notified: %s (status %d)\n", text, pid > 0 ? WEXITSTATUS(status) : -1);
+}
+
 static void *stream(void *arg) {
   (void)arg;
-  int playing = 0;
+  int playing = 0, unanswered = 0, warned = 0;
   long long last_status = 0;
   while (!stopping) {
     pthread_mutex_lock(&effect_lock);
-    if (!attached) effect_until = 0, playing = 0;  // nothing to play on
+    if (!attached) effect_until = 0, playing = 0, unanswered = 0;  // nothing to play on
     if (!playing && effect_until <= now_ms()) {
       struct timespec until;
       clock_gettime(CLOCK_REALTIME, &until);
@@ -322,6 +346,16 @@ static void *stream(void *arg) {
     } else {
       frames++;
       replies += r;
+      // A healthy Kishi answers every frame. One that has stopped answering has stopped vibrating
+      // too, and only unplugging it brings that back, so say so rather than leave it a mystery.
+      unanswered = r ? 0 : unanswered + 1;
+      if (unanswered == DEAF_FRAMES && !warned) {
+        warned = 1;
+        notify("Rumble is not reaching the Kishi. Unplug it and plug it back in.");
+      } else if (r && warned) {
+        warned = 0;
+        notify("Rumble is reaching the Kishi again.");
+      }
     }
     if (start - last_status >= 1000) {
       last_status = start;
