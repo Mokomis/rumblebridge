@@ -53,7 +53,7 @@ app/build.sh && adb install -r app/build/rumblebridge.apk
 
 ## Using it
 
-Attach the Kishi. The service runs from boot and takes it up by itself. Open games after the Kishi is attached; an app already running may need restarting to see the new pad.
+Attach the Kishi. The service runs from boot and takes it up by itself. (Checked by a reboot on 2026-10-08.) Open games after the Kishi is attached; an app already running may need restarting to see the new pad.
 
 The **Rumblebridge** app is a control panel, not part of the rumble path. It shows the service's status and sets:
 
@@ -106,7 +106,6 @@ For the DroidDeck hook, delete `Download/rumblebridge/` and the `BASH_ENV` line 
 - **Other firmware.** The frame format and the frequencies were found on firmware 2.0.0.0.
 - **Unplugging while the Kishi sleeps.** The pad should go with it; the sleep and wake were tested, the unplug was not.
 - **Rumble after Razer's app has really used the Kishi.** Handing over and taking back worked with no replug, but Razer's app had only reached its welcome screen.
-- **Starting at boot since the service was reworked** to run without a Kishi attached.
 - **The DroidDeck hook since the rename.** It builds, but DroidDeck no longer needs it and it has not been run under its new name.
 
 ## The haptics protocol, briefly
