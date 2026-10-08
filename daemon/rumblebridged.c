@@ -1,4 +1,4 @@
-// Gives the Razer Kishi V3 Pro rumble on Android. Runs as root, once per plug-in.
+// Gives the Razer Kishi V3 Pro rumble on Android. Runs as root from boot, Kishi or no Kishi.
 //
 // Android reports the Kishi as a gamepad with no motors: its haptics sit on a separate USB
 // interface with Razer's own protocol. This
@@ -16,8 +16,15 @@
 //    without input: it drops off USB and comes back when a button is pressed (seen with Razer's
 //    own app, which sends it nothing while idle). A once-a-second silent frame, tried here first,
 //    kept the USB link up through that, and the Kishi was then found answering frames but not
-//    vibrating until it was unplugged. So this lets it sleep; the boot script starts a fresh
-//    instance when it wakes.
+//    vibrating until it was unplugged. So this lets it sleep, and takes it up again when it wakes.
+//
+// The virtual pad outlives the Kishi's sleep: while the Kishi is off USB but still plugged into
+// the port, the pad stays, with every button released, so a game sees one controller throughout
+// instead of a disconnect and a new controller. It goes when the Kishi is really unplugged.
+//
+// "razer_app=1" hands the Kishi to Razer's own app: this lets go of it entirely and enables that
+// app; "razer_app=0" disables the app again and takes the Kishi back. Both want the haptics
+// interface, so it is one or the other.
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -31,6 +38,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/inotify.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +67,10 @@
 // spoofed KR only plays a capped, transient effect rather than persisting anything.
 #define TOKEN_FILE "/data/data/com.rumblebridge/files/token"
 #define TOKEN_LEN 16
+#define VIRTUAL_NAME "Razer Kishi V3 Pro (rumble)"
+#define RAZER_APP "com.razer.bianca"
+#define HOLD_GRACE_MS 5000         // a pad is never dropped sooner than this after the Kishi goes
+#define HOLD_UNKNOWN_MS 3600000    // how long it is kept where the port cannot say what is plugged in
 #define BITS_PER_LONG (8 * sizeof(long))
 #define NLONGS(n) (((n) + BITS_PER_LONG - 1) / BITS_PER_LONG)
 #define TEST_BIT(bits, n) (((bits)[(n) / BITS_PER_LONG] >> ((n) % BITS_PER_LONG)) & 1)
@@ -106,7 +119,7 @@ static void record_latency(long long us) {
 // 132 Hz, a third as strong). So the heavy motor plays at the strong peak and the light motor at
 // the lesser one, as on a pad with two different motors.
 static volatile int cfg_strength = 60, cfg_curve100 = 75, cfg_heavy = 100, cfg_light = 100;
-static volatile int cfg_heavy_freq = 10, cfg_light_freq = 35, cfg_enabled = 1;
+static volatile int cfg_heavy_freq = 10, cfg_light_freq = 35, cfg_enabled = 1, cfg_razer_app = 0;
 
 static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
@@ -118,11 +131,13 @@ static void apply_setting(const char *key, int v) {
   else if (!strcmp(key, "heavy_freq")) cfg_heavy_freq = clamp(v, 0, 127);
   else if (!strcmp(key, "light_freq")) cfg_light_freq = clamp(v, 0, 127);
   else if (!strcmp(key, "enabled")) cfg_enabled = v != 0;
+  else if (!strcmp(key, "razer_app")) cfg_razer_app = v != 0;
 }
 
 static int print_settings(char *out, size_t len) {
-  return snprintf(out, len, "strength=%d curve100=%d heavy=%d light=%d heavy_freq=%d light_freq=%d enabled=%d",
-                  cfg_strength, cfg_curve100, cfg_heavy, cfg_light, cfg_heavy_freq, cfg_light_freq, cfg_enabled);
+  return snprintf(out, len, "strength=%d curve100=%d heavy=%d light=%d heavy_freq=%d light_freq=%d enabled=%d razer_app=%d",
+                  cfg_strength, cfg_curve100, cfg_heavy, cfg_light, cfg_heavy_freq, cfg_light_freq, cfg_enabled,
+                  cfg_razer_app);
 }
 
 static void read_config(void) {
@@ -135,7 +150,7 @@ static void read_config(void) {
 }
 
 static void save_config(void) {
-  char line[200];
+  char line[240];
   int n = print_settings(line, sizeof line);
   int fd = open(CONFIG_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return;
@@ -242,9 +257,19 @@ static int send_frame(int usb, int low, int high) {
   return ioctl(usb, USBDEVFS_BULK, &in) > 0 ? 1 : 0;
 }
 
+// Where things stand. attached: the Kishi's buttons and haptics are open. Otherwise the virtual
+// pad may be held for a sleeping Kishi, or Razer's app may have the Kishi, or there is none.
+static volatile int attached, usb_lost;
+static pthread_mutex_t usb_lock = PTHREAD_MUTEX_INITIALIZER;  // held to use or close usb_fd
+static int usb_fd = -1, gamepad = -1, vpad = -1;
+
+static const char *state_name(void) {
+  return attached ? "attached" : cfg_razer_app ? "razer" : vpad >= 0 ? "held" : "waiting";
+}
+
 static int print_status(char *line, size_t len) {
-  int n = snprintf(line, len, "requests=%lu frames=%lu replies=%lu failures=%lu playing=%d,%d\n",
-                   requests, frames, replies, failures, effect_until > now_ms() ? effect_low : 0,
+  int n = snprintf(line, len, "state=%s requests=%lu frames=%lu replies=%lu failures=%lu playing=%d,%d\n",
+                   state_name(), requests, frames, replies, failures, effect_until > now_ms() ? effect_low : 0,
                    effect_until > now_ms() ? effect_high : 0);
   n += snprintf(line + n, len - n, "input batches=%lu mean_us=%lld max_us=%lld under_us", lat_count,
                 lat_count ? lat_sum_us / (long long)lat_count : 0, lat_max_us);
@@ -256,7 +281,7 @@ static int print_status(char *line, size_t len) {
 }
 
 static void write_status(void) {
-  char line[700];
+  char line[760];
   int n = print_status(line, sizeof line);
   int fd = open(STATUS_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return;
@@ -265,18 +290,19 @@ static void write_status(void) {
 }
 
 static void *stream(void *arg) {
-  int usb = *(int *)arg;
+  (void)arg;
   int playing = 0;
   long long last_status = 0;
   while (!stopping) {
     pthread_mutex_lock(&effect_lock);
+    if (!attached) effect_until = 0, playing = 0;  // nothing to play on
     if (!playing && effect_until <= now_ms()) {
       struct timespec until;
       clock_gettime(CLOCK_REALTIME, &until);
       until.tv_sec += STATUS_MS / 1000;
       pthread_cond_timedwait(&effect_changed, &effect_lock, &until);
     }
-    int on = effect_until > now_ms();
+    int on = attached && effect_until > now_ms();
     int low = on ? effect_low : 0, high = on ? effect_high : 0;
     pthread_mutex_unlock(&effect_lock);
     if (!on && !playing) {  // idle: say nothing to the Kishi, so it can go to sleep
@@ -286,10 +312,13 @@ static void *stream(void *arg) {
     // One silent frame ends an effect at once instead of letting the last frame run out.
     playing = on;
     long long start = now_ms();
-    int r = send_frame(usb, low, high);
+    pthread_mutex_lock(&usb_lock);
+    int r = usb_fd >= 0 ? send_frame(usb_fd, low, high) : -1;
+    int gone = usb_fd < 0 || (r < 0 && errno == ENODEV);
+    pthread_mutex_unlock(&usb_lock);
     if (r < 0) {
       failures++;
-      if (errno == ENODEV) break;  // unplugged
+      if (gone) usb_lost = 1, playing = 0;  // asleep or unplugged; the main loop lets go of it
     } else {
       frames++;
       replies += r;
@@ -299,15 +328,17 @@ static void *stream(void *arg) {
       write_status();
     }
     long long spent = now_ms() - start;
-    if (playing && spent < FRAME_MS) usleep((FRAME_MS - spent) * 1000);
+    if (spent < FRAME_MS) usleep((FRAME_MS - spent) * 1000);
   }
-  stopping = 1;
   return NULL;
 }
 
 // ---- the Kishi's buttons and sticks, and the virtual pad ----
 
-/** The Kishi's gamepad node: a Razer USB device with a south button and a left stick. */
+/**
+ * The Kishi's gamepad node: a Razer USB device with a south button and a left stick. Not the
+ * virtual pad, which carries the same identity and is still there while the Kishi sleeps.
+ */
 static int open_gamepad(char *path, size_t path_len, struct input_id *id) {
   DIR *dir = opendir("/dev/input");
   if (!dir) return -1;
@@ -318,7 +349,9 @@ static int open_gamepad(char *path, size_t path_len, struct input_id *id) {
     int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) continue;
     unsigned long keys[NLONGS(KEY_CNT)] = {0}, abs[NLONGS(ABS_CNT)] = {0};
-    if (ioctl(fd, EVIOCGID, id) == 0 && id->vendor == KISHI_VENDOR && id->product == KISHI_PRODUCT_HID &&
+    char name[80] = "";
+    ioctl(fd, EVIOCGNAME(sizeof name - 1), name);
+    if (strcmp(name, VIRTUAL_NAME) != 0 && ioctl(fd, EVIOCGID, id) == 0 && id->vendor == KISHI_VENDOR && id->product == KISHI_PRODUCT_HID &&
         id->bustype == BUS_USB && ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys) >= 0 &&
         TEST_BIT(keys, BTN_SOUTH) && ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs), abs) >= 0 && TEST_BIT(abs, ABS_X)) {
       closedir(dir);
@@ -330,12 +363,19 @@ static int open_gamepad(char *path, size_t path_len, struct input_id *id) {
   return -1;
 }
 
+// What the virtual pad offers, and where each axis sits untouched, for releasing everything when
+// the Kishi goes away with a button or a stick held.
+static unsigned long pad_keys[NLONGS(KEY_CNT)], pad_abs[NLONGS(ABS_CNT)];
+static int pad_rest[ABS_CNT];
+
 static int make_virtual(int gamepad, const struct input_id *id) {
   int fd = open("/dev/uinput", O_RDWR | O_CLOEXEC);
   if (fd < 0) return -1;
-  unsigned long keys[NLONGS(KEY_CNT)] = {0}, abs[NLONGS(ABS_CNT)] = {0};
-  ioctl(gamepad, EVIOCGBIT(EV_KEY, sizeof keys), keys);
-  ioctl(gamepad, EVIOCGBIT(EV_ABS, sizeof abs), abs);
+  unsigned long *keys = pad_keys, *abs = pad_abs;
+  memset(pad_keys, 0, sizeof pad_keys);
+  memset(pad_abs, 0, sizeof pad_abs);
+  ioctl(gamepad, EVIOCGBIT(EV_KEY, sizeof pad_keys), keys);
+  ioctl(gamepad, EVIOCGBIT(EV_ABS, sizeof pad_abs), abs);
   ioctl(fd, UI_SET_EVBIT, EV_KEY);
   for (int k = 0; k < KEY_CNT; k++)
     if (TEST_BIT(keys, k)) ioctl(fd, UI_SET_KEYBIT, k);
@@ -344,6 +384,10 @@ static int make_virtual(int gamepad, const struct input_id *id) {
     if (!TEST_BIT(abs, a)) continue;
     struct uinput_abs_setup setup = {.code = a};
     if (ioctl(gamepad, EVIOCGABS(a), &setup.absinfo) < 0) continue;
+    // A d-pad hat and a signed stick rest at 0 and a trigger at its minimum. Any other axis is
+    // taken to be at rest now, as the Kishi has only just been plugged in or woken.
+    pad_rest[a] = (a >= ABS_HAT0X && a <= ABS_HAT3Y) || setup.absinfo.minimum < 0 ? 0
+                  : a == ABS_GAS || a == ABS_BRAKE ? setup.absinfo.minimum : setup.absinfo.value;
     ioctl(fd, UI_SET_ABSBIT, a);
     ioctl(fd, UI_ABS_SETUP, &setup);
   }
@@ -351,7 +395,7 @@ static int make_virtual(int gamepad, const struct input_id *id) {
   ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
   // The Kishi's own vendor and product, so Android picks the same key layout for it.
   struct uinput_setup setup = {.id = *id, .ff_effects_max = MAX_EFFECTS};
-  snprintf(setup.name, sizeof setup.name, "Razer Kishi V3 Pro (rumble)");
+  snprintf(setup.name, sizeof setup.name, VIRTUAL_NAME);
   if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
     close(fd);
     return -1;
@@ -359,66 +403,181 @@ static int make_virtual(int gamepad, const struct input_id *id) {
   return fd;
 }
 
+/** Every button up and every axis at rest on the virtual pad. */
+static void release_all(void) {
+  if (vpad < 0) return;
+  struct input_event ev[KEY_CNT / 8];
+  size_t n = 0;
+  for (int k = 0; k < KEY_CNT; k++) {
+    if (!TEST_BIT(pad_keys, k)) continue;
+    ev[n++] = (struct input_event){.type = EV_KEY, .code = k, .value = 0};
+    if (n == sizeof ev / sizeof ev[0] - 1) break;
+  }
+  (void)!write(vpad, ev, n * sizeof ev[0]);
+  n = 0;
+  for (int a = 0; a < ABS_CNT; a++)
+    if (TEST_BIT(pad_abs, a)) ev[n++] = (struct input_event){.type = EV_ABS, .code = a, .value = pad_rest[a]};
+  ev[n++] = (struct input_event){.type = EV_SYN, .code = SYN_REPORT};
+  (void)!write(vpad, ev, n * sizeof ev[0]);
+}
+
+static void drop_virtual(void) {
+  if (vpad < 0) return;
+  ioctl(vpad, UI_DEV_DESTROY);
+  close(vpad);
+  vpad = -1;
+  printf("virtual pad removed\n");
+}
+
+/** Takes up a Kishi that is on USB: its haptics, its buttons, and the virtual pad if there is none yet. */
+static void attach(void) {
+  static char said[160];
+  char path[64], problem[160] = "";
+  struct input_id id;
+  int g = open_gamepad(path, sizeof path, &id);
+  if (g < 0) return;
+  int u = open_haptics();
+  if (u < 0) snprintf(problem, sizeof problem, "could not take the Kishi's haptics interface: %s", strerror(errno));
+  if (!*problem && vpad < 0 && (vpad = make_virtual(g, &id)) < 0)
+    snprintf(problem, sizeof problem, "could not create the virtual pad: %s", strerror(errno));
+  // Event timestamps on the monotonic clock, to time the pass-through against.
+  int clock_id = CLOCK_MONOTONIC;
+  ioctl(g, EVIOCSCLOCKID, &clock_id);
+  // From here Android hears the Kishi only through the virtual pad.
+  if (!*problem && ioctl(g, EVIOCGRAB, 1) < 0) snprintf(problem, sizeof problem, "could not grab %s: %s", path, strerror(errno));
+  if (*problem) {
+    if (strcmp(problem, said)) fprintf(stderr, "%s\n", problem);  // once, not at every retry
+    snprintf(said, sizeof said, "%s", problem);
+    if (u >= 0) close(u);
+    close(g);
+    return;
+  }
+  said[0] = 0;
+  pthread_mutex_lock(&usb_lock);
+  usb_fd = u;
+  pthread_mutex_unlock(&usb_lock);
+  gamepad = g;
+  usb_lost = 0;
+  attached = 1;
+  printf("Kishi on %s: virtual pad with rumble is up\n", path);
+}
+
+/** Lets go of the Kishi (asleep, unplugged, or wanted by Razer's app). The virtual pad stays. */
+static void detach(const char *why) {
+  attached = 0;
+  pthread_mutex_lock(&usb_lock);
+  close(usb_fd);
+  usb_fd = -1;
+  pthread_mutex_unlock(&usb_lock);
+  ioctl(gamepad, EVIOCGRAB, 0);
+  close(gamepad);
+  gamepad = -1;
+  release_all();
+  printf("let go of the Kishi: %s\n", why);
+}
+
+/** Whether anything is plugged into a USB-C port: 1, 0, or -1 where the kernel does not say. */
+static int port_occupied(void) {
+  DIR *dir = opendir("/sys/class/typec");
+  if (!dir) return -1;
+  struct dirent *e;
+  int found = 0;
+  while (!found && (e = readdir(dir))) {
+    size_t n = strlen(e->d_name);
+    found = n > 8 && !strcmp(e->d_name + n - 8, "-partner");
+  }
+  closedir(dir);
+  return found;
+}
+
+/** Enables or disables Razer's app, as "cmd package" would from a root shell. */
+static void set_razer_app(int on) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    if (on) execl("/system/bin/cmd", "cmd", "package", "enable", RAZER_APP, (char *)NULL);
+    else execl("/system/bin/cmd", "cmd", "package", "disable-user", "--user", "0", RAZER_APP, (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (pid > 0) waitpid(pid, &status, 0);
+  printf("Razer's app %s (status %d)\n", on ? "enabled" : "disabled", pid > 0 ? WEXITSTATUS(status) : -1);
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   read_config();
-  char path[64];
-  struct input_id id;
-  int gamepad = open_gamepad(path, sizeof path, &id);
-  if (gamepad < 0) {
-    fprintf(stderr, "no Kishi in HID mode under /dev/input\n");
-    return 2;
-  }
-  int usb = open_haptics();
-  if (usb < 0) {
-    fprintf(stderr, "could not take the Kishi's haptics interface: %s\n", strerror(errno));
-    return 1;
-  }
-  int vpad = make_virtual(gamepad, &id);
-  if (vpad < 0) {
-    fprintf(stderr, "could not create the virtual pad: %s\n", strerror(errno));
-    return 1;
-  }
-  // Event timestamps on the monotonic clock, to time the pass-through against.
-  int clock_id = CLOCK_MONOTONIC;
-  ioctl(gamepad, EVIOCSCLOCKID, &clock_id);
-  // From here Android hears the Kishi only through the virtual pad.
-  if (ioctl(gamepad, EVIOCGRAB, 1) < 0) {
-    fprintf(stderr, "could not grab %s: %s\n", path, strerror(errno));
-    ioctl(vpad, UI_DEV_DESTROY);
-    return 1;
-  }
+  int razer_app = cfg_razer_app;  // as last applied; the app's state is left alone at start-up
   int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(RUMBLE_PORT)};
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (bind(udp, (struct sockaddr *)&addr, sizeof addr) < 0)
-    fprintf(stderr, "UDP %d is taken, so the DroidDeck hook will not be heard: %s\n", RUMBLE_PORT, strerror(errno));
+  if (bind(udp, (struct sockaddr *)&addr, sizeof addr) < 0) {
+    fprintf(stderr, "UDP %d is taken: %s\n", RUMBLE_PORT, strerror(errno));
+    return 1;
+  }
+  // Wakes the loop the moment an input device appears, so a waking Kishi is taken up at once.
+  int watch = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  inotify_add_watch(watch, "/dev/input", IN_CREATE | IN_ATTRIB);
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
   signal(SIGHUP, SIG_IGN);
   pthread_t streamer;
-  pthread_create(&streamer, NULL, stream, &usb);
+  pthread_create(&streamer, NULL, stream, NULL);
   // The input pass-through runs at real-time priority so a busy game cannot delay a button press.
   // The streaming thread above keeps normal priority.
   struct sched_param rt = {.sched_priority = 2};
   if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &rt) != 0) fprintf(stderr, "no real-time priority for input\n");
-  printf("Kishi on %s: virtual pad with rumble is up\n", path);
+  printf("rumblebridged is up\n");
 
   struct ff_effect effects[MAX_EFFECTS] = {0};
-  struct pollfd fds[3] = {{.fd = gamepad, .events = POLLIN}, {.fd = vpad, .events = POLLIN}, {.fd = udp, .events = POLLIN}};
   struct input_event ev[64];
+  long long next_try = 0, eager_until = 0, detached_at = now_ms();
   while (!stopping) {
-    if (poll(fds, 3, 500) < 0) {
+    if (cfg_razer_app != razer_app) {
+      razer_app = cfg_razer_app;
+      if (razer_app && attached) detach("handed to Razer's app");
+      if (razer_app) drop_virtual();
+      set_razer_app(razer_app);
+      next_try = 0;
+    }
+    if (attached && usb_lost) detach("it left USB"), detached_at = now_ms();
+    if (!attached && !razer_app) {
+      long long now = now_ms();
+      if (now >= next_try) {
+        // Often while a device has just appeared (its USB node can lag its input node), else rarely.
+        next_try = now + (now < eager_until ? 200 : 5000);
+        attach();
+      }
+      // A sleeping Kishi is still in the port; an unplugged one is not, and its pad goes with it.
+      if (!attached && vpad >= 0 && now - detached_at > HOLD_GRACE_MS) {
+        int occupied = port_occupied();
+        if (occupied == 0 || (occupied < 0 && now - detached_at > HOLD_UNKNOWN_MS)) drop_virtual();
+      }
+    }
+    struct pollfd fds[4] = {{.fd = gamepad, .events = POLLIN}, {.fd = vpad, .events = POLLIN},
+                            {.fd = udp, .events = POLLIN}, {.fd = watch, .events = POLLIN}};
+    if (poll(fds, 4, attached ? 500 : 1000) < 0) {
       if (errno == EINTR) continue;
       break;
     }
-    if (fds[0].revents & (POLLERR | POLLHUP)) break;  // unplugged
+    if (fds[3].revents & POLLIN) {
+      char skip[1024];
+      while (read(watch, skip, sizeof skip) > 0) {}
+      next_try = 0;
+      eager_until = now_ms() + 5000;
+    }
     if (fds[0].revents & POLLIN) {
       ssize_t n = read(gamepad, ev, sizeof ev);
-      if (n <= 0 || write(vpad, ev, n) < 0) break;
+      if (n <= 0) {
+        detach("it left USB"), detached_at = now_ms();
+        continue;
+      }
+      if (write(vpad, ev, n) < 0) break;
       struct timespec t;
       clock_gettime(CLOCK_MONOTONIC, &t);
       record_latency((t.tv_sec - ev[0].time.tv_sec) * 1000000LL + (t.tv_nsec / 1000 - ev[0].time.tv_usec));
+    } else if (fds[0].revents & (POLLERR | POLLHUP)) {
+      detach("it left USB"), detached_at = now_ms();
+      continue;
     }
     if (fds[1].revents & POLLIN) {
       ssize_t n = read(vpad, ev, sizeof ev);
@@ -467,7 +626,7 @@ int main(void) {
         }
       }
       if (n >= 2 && p[0] == 'K' && (p[1] == 'Q' || p[1] == 'C')) {
-        char status[700];
+        char status[760];
         int len = print_status(status, sizeof status);
         sendto(udp, status, len, MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *)&from, from_len);
       }
@@ -478,8 +637,8 @@ int main(void) {
   pthread_cond_signal(&effect_changed);
   pthread_mutex_unlock(&effect_lock);
   pthread_join(streamer, NULL);
-  ioctl(gamepad, EVIOCGRAB, 0);
-  ioctl(vpad, UI_DEV_DESTROY);
+  if (attached) detach("stopping");
+  drop_virtual();
   unlink(STATUS_FILE);
   return 0;
 }

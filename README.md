@@ -27,7 +27,7 @@ Rumblebridge is for what those leave out: apps with no controller driver of thei
 
 ## How it works
 
-`rumblebridged` runs whenever the Kishi is attached and does three things:
+`rumblebridged` runs from boot, waits for the Kishi, and does three things:
 
 1. **Creates a virtual controller.** It grabs the Kishi's buttons and sticks and mirrors them onto a virtual gamepad, "Razer Kishi V3 Pro (rumble)", which Android sees as having motors. Apps use that pad and never see the difference.
 2. **Collects rumble.** Anything an app plays on the virtual pad arrives here. So do packets on UDP `127.0.0.1:47811` from the optional DroidDeck hook (below).
@@ -53,7 +53,7 @@ app/build.sh && adb install -r app/build/rumblebridge.apk
 
 ## Using it
 
-Attach the Kishi. The service starts by itself, at boot as well, and stops when the Kishi is unplugged. Open games after the Kishi is attached; an app already running may need restarting to see the new pad.
+Attach the Kishi. The service runs from boot and takes it up by itself. Open games after the Kishi is attached; an app already running may need restarting to see the new pad.
 
 The **Rumblebridge** app is a control panel, not part of the rumble path. It shows the service's status and sets:
 
@@ -69,14 +69,9 @@ Two buttons test rumble the way a game sends it and the way DroidDeck sends it. 
 
 ## Rules
 
-- **Keep Razer Nexus closed while this runs.** Both want the haptics interface. If Android opens Nexus by itself whenever the Kishi is attached, it will start on every plug-in and every wake; clear that default or disable Nexus while you use this. To use Nexus, stop the service first, then replug the Kishi when you are done:
-
-  ```bash
-  adb shell 'su -c "kill \$(cat /data/adb/rumblebridge/pid); pkill -x rumblebridged"'    # stop
-  adb shell 'su -c "nohup /data/adb/service.d/rumblebridged.sh >/dev/null 2>&1 &"'      # start again
-  ```
-- **The Kishi sleeps after fifteen minutes without input, and that is fine.** It drops off USB and returns when a button is pressed; Razer's own app sees the same. The service sends nothing while idle, stops when the Kishi leaves and starts again when it returns. Measured on 2026-10-08: asleep at fifteen minutes, back within seconds of a button press, rumble at full strength afterwards with no replug. An app may need a moment to pick the controller up again.
-- **If rumble stops, unplug and replug the Kishi.** That resets its haptics, and the service restarts by itself.
+- **Razer's app and this cannot both have the Kishi.** Both want the haptics interface. If Android opens Razer's app by itself whenever the Kishi is attached, it will start on every plug-in and every wake, so the app is best left disabled while you use this. The control panel's **Hand the Kishi to Razer's app** button does the swap for you: the service lets go of the Kishi, removes the virtual pad, enables Razer's app (`com.razer.bianca`) and opens it. **Take the Kishi back** disables Razer's app again and resumes. If rumble is silent afterwards, unplug and replug the Kishi. The choice survives a reboot.
+- **The Kishi sleeps after fifteen minutes without input, and that is fine.** It drops off USB and returns when a button is pressed; Razer's own app sees the same. The service sends nothing while idle. While the Kishi sleeps the virtual pad stays, with every button released, so a game keeps the same controller and sees no disconnect; the service takes the Kishi up again when it wakes. The pad is removed when the Kishi is unplugged from the port.
+- **If rumble stops, unplug and replug the Kishi.** That resets its haptics, and the service takes it up again by itself.
 - **Do not keep the Kishi awake with idle traffic.** An earlier version sent a silent frame every second. That kept the USB link up through the Kishi's sleep timer, and after about twenty minutes untouched the Kishi answered frames without vibrating until it was unplugged.
 - **Never send the Kishi's haptics interface anything but stream frames.** A query or a setting on that interface (haptics mode and gain were tried) stops it playing frames until it is replugged. It still accepts them, but neither answers nor vibrates. `rumblebridged` only sends frames; this matters if you change the code.
 

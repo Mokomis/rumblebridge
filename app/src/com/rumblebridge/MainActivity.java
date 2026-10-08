@@ -74,6 +74,11 @@ public final class MainActivity extends Activity {
     private final Runnable pollRunnable = this::poll;
     private TextView status;
     private Switch enabled;
+    private Button razer;
+    private boolean razerHasKishi;
+    /** Polls left in which to open Razer's app, once the daemon says it has been enabled. */
+    private int openRazerTries;
+    private static final String RAZER_APP = "com.razer.bianca";
     private volatile boolean dragging;
     private boolean showing;
     private volatile ServerSocket probe;
@@ -122,6 +127,11 @@ public final class MainActivity extends Activity {
         page.addView(button("Test rumble as a game would", () -> toast(rumbleController(1000))));
         page.addView(button("Test rumble as DroidDeck would", () -> sendRumble(0xFFFF, 0xFFFF, 1000)));
         page.addView(button("Reset to defaults", () -> send("KC " + DEFAULTS)));
+        razer = button("Hand the Kishi to Razer's app", () -> {
+            if (!razerHasKishi) openRazerTries = 5;
+            send("KC razer_app=" + (razerHasKishi ? 0 : 1));
+        });
+        page.addView(razer);
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(page);
@@ -228,7 +238,8 @@ public final class MainActivity extends Activity {
     private void show(String reply) {
         View[] controls = {enabled};
         if (reply == null) {
-            status.setText("The rumble service is not answering.\nIt runs only while the Kishi is attached, in HID mode.");
+            status.setText("The rumble service is not answering.");
+            razer.setEnabled(false);
             for (View v : controls) v.setEnabled(false);
             for (Setting s : settings) s.bar.setEnabled(false);
             return;
@@ -239,10 +250,30 @@ public final class MainActivity extends Activity {
             if (eq > 0) v.put(word.substring(0, eq), word.substring(eq + 1));
         }
         long frames = number(v, "frames"), replies = number(v, "replies");
-        status.setText("Kishi attached, rumble service running.\n"
-            + number(v, "requests") + " rumble requests; the Kishi answered " + replies + " of " + frames + " frames"
+String state = v.getOrDefault("state", "attached");
+        String counts = number(v, "requests") + " rumble requests; the Kishi answered " + replies + " of " + frames + " frames"
             + (number(v, "failures") > 0 ? " (" + number(v, "failures") + " failed)" : "") + ".\n"
-            + "Controller pass-through: " + number(v, "mean_us") + " µs on average, " + number(v, "max_us") + " µs at worst.");
+            + "Controller pass-through: " + number(v, "mean_us") + " µs on average, " + number(v, "max_us") + " µs at worst.";
+        switch (state) {
+            case "attached": status.setText("Kishi attached, rumble service running.\n" + counts); break;
+            case "held": status.setText("The Kishi is asleep. Its controller is kept for games until it wakes.\n" + counts); break;
+            case "razer": status.setText("Razer's app has the Kishi. Rumblebridge is standing by.\n"
+                + "When you take it back, unplug and replug the Kishi if rumble stays silent."); break;
+            default: status.setText("No Kishi attached. The rumble service is waiting for one, in HID mode."); break;
+        }
+        razerHasKishi = state.equals("razer");
+        razer.setEnabled(true);
+        razer.setText(razerHasKishi ? "Take the Kishi back from Razer's app" : "Hand the Kishi to Razer's app");
+        if (razerHasKishi && openRazerTries > 0) {
+            // The package manager takes a moment to enable the app; until then there is nothing to open.
+            android.content.Intent open = getPackageManager().getLaunchIntentForPackage(RAZER_APP);
+            if (open != null) {
+                openRazerTries = 0;
+                startActivity(open);
+            } else if (--openRazerTries == 0) {
+                toast("Razer's app is enabled. Open it from the home screen.");
+            }
+        }
         for (View c : controls) c.setEnabled(true);
         enabled.setChecked(number(v, "enabled") != 0);
         for (Setting s : settings) {
