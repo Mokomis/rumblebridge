@@ -12,6 +12,21 @@ The Kishi V3 Pro has two haptic motors, and on Android ordinary controller rumbl
 
 Rumblebridge was written to get rumble in remote-play sessions and in PC games run through DroidDeck on that tablet, without patching any of the apps involved. Putting the fix under Android's controller layer means an app that already supports controller vibration works unchanged.
 
+## Do you need this?
+
+Check these first. Each is simpler than a root service.
+
+- **Moonlight and its forks (Artemis, Artemide): probably not.** They carry their own USB driver for Xbox-style pads. A user reports rumble working with the Kishi V3 Pro forced into XInput mode in Razer Nexus (Auto XInput Mode off) and the client's "Xbox 360/One USB gamepad driver" and "Override native Xbox gamepad support" settings on. No root. Not tested here.
+- **A device whose kernel has Xbox-pad rumble (`CONFIG_JOYSTICK_XPAD_FF`): probably not.** XInput mode may rumble in every app with no extra software.
+- **A phone with its own vibration motor, streaming with PunktFunk:** its "Rumble on this phone" setting plays the controller's rumble on the phone body instead. Not the Kishi's motors, but no root.
+- **OpenNOW (GeForce NOW client):** [a pull request](https://github.com/OpenCloudGaming/OpenNOW/pull/1125), open as of October 2026, adds Kishi haptics inside that app.
+
+Rumblebridge is for what those leave out: apps with no controller driver of their own, on a device where XInput mode stays silent. Checked on 2026-10-08:
+
+- **DroidDeck 0.3.1** has no USB controller driver; it plays rumble only on motors Android reports.
+- **PunktFunk** (source as of 2026-10-07) drives Sony and Valve pads over USB itself, but has no Razer or Xbox-style driver, and its body-rumble fallback is for built-in controllers only.
+- **Ordinary Android games** use whatever Android reports, which for the Kishi in HID mode is no motors.
+
 ## How it works
 
 `rumblebridged` runs whenever the Kishi is attached and does three things:
@@ -28,8 +43,6 @@ Measured on the tablet above: the virtual pad adds about 0.15 ms to controller i
 - **64-bit ARM Android** with a kernel that has `uinput` and force feedback (`CONFIG_INPUT_UINPUT`, `CONFIG_INPUT_FF_MEMLESS`).
 - **Razer Kishi V3 Pro in HID mode.** XInput mode has no haptics interface. Other Kishi models are not matched.
 - **To build:** `adb`, the Android NDK, and for the control app JDK 17 and the Android SDK build tools 35. The DroidDeck hook needs Zig.
-
-If your device's kernel has rumble support for Xbox-style USB pads (`CONFIG_JOYSTICK_XPAD_FF`), try the Kishi's XInput mode first: it may rumble with no extra software.
 
 ## Install
 
