@@ -1,8 +1,6 @@
 # Rumblebridge
 
-Rumble for the Razer Kishi V3 Pro on Android, for games and streaming clients that use ordinary controller vibration.
-
-Android reports the Kishi as a controller with no rumble motors, so games have nowhere to send rumble. The Kishi's haptics sit on a separate USB interface with Razer's own protocol. Rumblebridge is a small root service that bridges the two.
+Android sees the Razer Kishi V3 Pro as a controller with no motors, so games' rumble goes nowhere. The standard fallback, XInput mode, needs a kernel option that some Android devices, including the OPPO Pad Mini, ship without. Razer's own app offers audio-to-haptics, which vibrates to game sound rather than the game's rumble. Rumblebridge speaks Razer's haptics protocol directly, so the rumble a game or streaming client actually sends reaches the Kishi's motors.
 
 **Status: one person's working setup, not a product.** It has run on a single tablet (OPPO Pad Mini OPD2515, ColorOS 16, KernelSU) with one Kishi V3 Pro on firmware 2.0.0.0. It runs as root and takes over the controller's input. Read [What is not proven](#what-is-not-proven) before installing it anywhere else.
 
